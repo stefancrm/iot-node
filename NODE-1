@@ -1,0 +1,323 @@
+#include <BH1750.h>             //BH1750 library
+#include <SFE_BMP180.h>         //BMP180 library
+#include "DHTesp.h"             //DHT11 Library
+#include <Adafruit_ADS1015.h>   //ADS library
+#include <Wire.h>               //serial Library for i2c
+#include <ESP8266WiFi.h>        // ESP wifi library 
+#include <ThingsBoard.h>        //Thingsboard Library
+
+//Ligth sensor
+#define _TOOLOW                       25
+#define _LOW                          50
+#define _HIGH                         500
+#define _TOOHIGH                      750
+#define LEVEL_TOOLOW                  "Too low"      // Too low
+#define LEVEL_LOW                     "Low"           // Low
+#define LEVEL_OPTIMAL                 "Ideal"         // Ideal
+#define LEVEL_HIGH                    "High"         // High
+#define LEVEL_TOOHIGH                 "Too High"    // Too High
+
+uint16_t lux        = 250;
+int      luxLevel   = 3;
+String   luxMessage = LEVEL_OPTIMAL;
+
+BH1750 lightMeter(0x23);
+
+//Define I2C Analog-Digital 
+Adafruit_ADS1115 ads(0x48);   
+
+//--------------Wifi and Static IP address configuration
+#define WIFI_AP "SSID" //WIFI SSID 
+#define WIFI_PASSWORD "PassWord" //WIFI PASSWORD
+IPAddress staticIP(192, 168, 10, 50);  //ESP static ip
+IPAddress gateway(192, 168, 10, 1);   //IP Address of your WiFi Router (Gateway)
+IPAddress subnet(255, 255, 255, 0);  //Subnet mask
+
+WiFiClient wifiClient;
+
+int status = WL_IDLE_STATUS;
+unsigned long lastSend;
+
+//--------------Thingsboard Acces Token and server
+#define TOKEN "token" //Thingsboard TOKEN 
+char thingsboardServer[] = "192.168.10.1"; //Thingsboard Server adress 
+
+ThingsBoard tb(wifiClient);
+
+//--------------SFE_BMP180 object
+SFE_BMP180 pressure;
+#define ALTITUDE 235.0 // Altitude in meters
+
+//--------------DHT11 configuration
+#define DHTpin 14    //D5 of NodeMCU is GPIO14
+DHTesp dht;
+
+//--------------Anemometer
+const byte interruptPin = 13;
+volatile byte interruptCounter = 0;
+int numberOfInterrupts = 0;
+volatile float rpmcount = 0;
+float rpm = 0;
+float radial_vel = 0;
+float linear_vel = 0;
+unsigned long lastmillis = 0;
+
+
+void setup() {
+
+  // Serial Begin
+ Serial.begin(115200);
+ Serial.println("REBOOT:");
+ InitWiFi();                        //init Wifi
+ pressure.begin();                  //init BMP180
+ dht.setup(DHTpin, DHTesp::DHT11); // DHT11 Connect 
+ ads.begin();                       //init ADS
+  lastSend = 0;
+
+  pinMode(interruptPin, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(interruptPin), handleInterrupt, FALLING);
+
+  lightMeter.begin();
+}
+
+//intrerupt counter
+ICACHE_RAM_ATTR void handleInterrupt() {
+  interruptCounter++;
+}
+
+void loop() {
+  if ( !tb.connected() ) {
+    reconnect();
+  }
+
+  if ( millis() - lastSend > 2000 ) { // Update and send only after 1 seconds
+    GetData();
+Serial.println(" --------measure ligth intensity-----------"); 
+    getLigth();
+Serial.println(" --------count intrerupt signals for anemometer-----------");
+    
+    lastSend = millis();
+    detachInterrupt(interruptPin);    //Disable interrupt when calculating.
+    rpm = interruptCounter * 60;  //Convert frecuency to RPM, note: this works for one interruption per full rotation. For two interrups per full rotation use rpmcount * 30.
+    radial_vel = rpm * M_PI / 30; //convert rpm to radial velocity in rad/s.
+    linear_vel = radial_vel * 0.017; //convert radial velocity to linear velocity in m/s.
+    Serial.print("RPM = "); //print the word "RPM".
+    Serial.print(rpm); // print the rpm value.
+     Serial.print("\t\t Linear Speed = "); //print the word "Linear Velocity".
+    Serial.print(linear_vel); //print the linear velocity value.
+    Serial.println(" m/s"); //print the word "m/s".
+    tb.sendTelemetryFloat("speed", linear_vel);
+ 
+    interruptCounter = 0; // Restart the RPM counter
+    lastmillis = millis(); // Update lasmillis
+    attachInterrupt(digitalPinToInterrupt(interruptPin), handleInterrupt, FALLING);
+    Serial.println(" --------finish-----------");
+  }
+
+  tb.loop();
+  //ESP.deepSleep(e6);  //disable deeb sleep
+
+}
+void getLigth(){
+  lux = lightMeter.readLightLevel();
+  
+  if ( lux <= _TOOLOW ) {
+    luxLevel = 1;
+    luxMessage = LEVEL_TOOLOW;
+  } else if ( lux > _TOOLOW && lux <= _LOW ) {
+    luxLevel = 2;
+    luxMessage = LEVEL_LOW;
+  } else if ( lux > _LOW && lux <= _HIGH ) {
+    luxLevel = 3;
+    luxMessage = LEVEL_OPTIMAL;
+  } else if ( lux > _HIGH && lux < _TOOHIGH ) {
+    luxLevel = 4;
+    luxMessage = LEVEL_HIGH;
+  } else {
+    luxLevel = 5;
+    luxMessage = LEVEL_TOOHIGH;
+  }
+  
+  Serial.print("Light: "); 
+  Serial.print(lux);
+  Serial.print(" lx, level: ");
+  Serial.print(luxLevel);
+  Serial.print(" , quality: ");
+  Serial.println(luxMessage);
+  delay(1000);
+   tb.sendTelemetryFloat("Light", lux);
+  }
+void GetData()
+{
+  char status;
+  double T,P,p0,a;
+
+  // Loop here getting pressure readings every 10 seconds.
+
+  // If you want sea-level-compensated pressure, as used in weather reports,
+  // you will need to know the altitude at which your measurements are taken.
+  // We're using a constant called ALTITUDE in this sketch:
+  Serial.println();
+  Serial.print("NODE 4 Token: ");
+  Serial.println(TOKEN);
+  
+  Serial.println();
+  Serial.print("provided altitude: ");
+  Serial.print(ALTITUDE,0);
+  Serial.println(" meters, ");
+  
+  // If you want to measure altitude, and not pressure, you will instead need
+  // to provide a known baseline pressure. This is shown at the end of the sketch.
+
+  // You must first get a temperature measurement to perform a pressure reading.
+  
+  // Start a temperature measurement:
+  // If request is successful, the number of ms to wait is returned.
+  // If request is unsuccessful, 0 is returned.
+
+  status = pressure.startTemperature();
+  if (status != 0)
+  {
+    // Wait for the measurement to complete:
+    delay(status);
+
+    // Retrieve the completed temperature measurement:
+    // Note that the measurement is stored in the variable T.
+    // Function returns 1 if successful, 0 if failure.
+
+    status = pressure.getTemperature(T);
+    if (status != 0)
+    {
+      // Print out the measurement:
+      Serial.print("temperature: ");
+      Serial.print(T,2);
+      Serial.println(" deg C, ");
+      tb.sendTelemetryFloat("temperature", T);
+      
+      // Start a pressure measurement:
+      // The parameter is the oversampling setting, from 0 to 3 (highest res, longest wait).
+      // If request is successful, the number of ms to wait is returned.
+      // If request is unsuccessful, 0 is returned.
+
+      status = pressure.startPressure(2);
+      if (status != 0)
+      {
+        // Wait for the measurement to complete:
+        delay(status);
+
+        // Retrieve the completed pressure measurement:
+        // Note that the measurement is stored in the variable P.
+        // Note also that the function requires the previous temperature measurement (T).
+        // (If temperature is stable, you can do one temperature measurement for a number of pressure measurements.)
+        // Function returns 1 if successful, 0 if failure.
+
+        status = pressure.getPressure(P,T);
+        if (status != 0)
+        {
+          // Print out the measurement:
+          Serial.print("absolute pressure: ");
+          Serial.print(P,2);
+          Serial.println(" mb, ");
+          tb.sendTelemetryFloat("pressure", P);
+
+          // The pressure sensor returns absolute pressure, which varies with altitude.
+          // To remove the effects of altitude, use the sea level function and your current altitude.
+          // This number is commonly used in weather reports.
+          // Parameters: P = absolute pressure in mb, ALTITUDE = current altitude in m.
+          // Result: p0 = sea-level compensated pressure in mb
+
+          p0 = pressure.sealevel(P,ALTITUDE); // we're at 1655 meters (Boulder, CO)
+          Serial.print("relative (sea-level) pressure: ");
+          Serial.print(p0,2);
+          Serial.println(" mb, ");
+
+          // On the other hand, if you want to determine your altitude from the pressure reading,
+          // use the altitude function along with a baseline pressure (sea-level or other).
+          // Parameters: P = absolute pressure in mb, p0 = baseline pressure in mb.
+          // Result: a = altitude in m.
+
+          a = pressure.altitude(P,p0);
+          Serial.print("computed altitude: ");
+          Serial.print(a,0);
+          Serial.println(" meters, ");
+          tb.sendTelemetryFloat("altitude", a);
+        }
+        else Serial.println("error retrieving pressure measurement\n");
+      }
+      else Serial.println("error starting pressure measurement\n");
+    }
+    else Serial.println("error retrieving temperature measurement\n");
+  }
+  else Serial.println("error starting temperature measurement\n");
+
+ double humidity = dht.getHumidity();
+  tb.sendTelemetryFloat("humidity", humidity);
+ double temperature2 = dht.getTemperature();
+  tb.sendTelemetryFloat("temperature2", temperature2);
+  Serial.print("DHT Humidity:");
+  Serial.println(humidity);
+  Serial.print("DHT Temperature:");
+  Serial.println(temperature2);
+
+  Serial.print("Analog 0:");
+int A0 = ads.readADC_SingleEnded(0);
+  tb.sendTelemetryFloat("A0", A0);
+  Serial.println(A0);
+
+  Serial.print("Analog 1:");
+int A1 = ads.readADC_SingleEnded(1);
+  tb.sendTelemetryFloat("A1", A1);
+  Serial.println(A1);
+  
+    Serial.print("Analog 2:");
+int A2 = ads.readADC_SingleEnded(2);
+  tb.sendTelemetryFloat("A2", A2);
+  Serial.println(A2);
+  
+    Serial.print("Analog 3:");
+int A3 = ads.readADC_SingleEnded(3);
+  tb.sendTelemetryFloat("A3", A3);
+  Serial.println(A3);
+ 
+  delay(dht.getMinimumSamplingPeriod());  // Pause for x seconds.
+}
+
+void InitWiFi()
+{
+  Serial.println("Connecting to AP ...");
+  // attempt to connect to WiFi network
+  WiFi.config(staticIP, subnet, gateway);
+  WiFi.begin(WIFI_AP, WIFI_PASSWORD);
+  WiFi.mode(WIFI_STA); //WiFi mode station (connect to wifi router only
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.println("....Waiting for wifi connection.....");
+  }
+  Serial.println("Connected to AP");
+}
+
+
+void reconnect() {
+  // Loop until we're reconnected
+  while (!tb.connected()) {
+    status = WiFi.status();
+    if ( status != WL_CONNECTED) {
+      WiFi.config(staticIP, subnet, gateway);
+      WiFi.begin(WIFI_AP, WIFI_PASSWORD);
+      while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.println("....Waiting for wifi connection.....");
+      }
+      Serial.println("Connected to AP");
+    }
+    Serial.print("Connecting to ThingsBoard node ...");
+    if ( tb.connect(thingsboardServer, TOKEN) ) {
+      Serial.println( "[DONE]" );
+    } else {
+      Serial.print( "[FAILED]" );
+      Serial.println( " : retrying in 5 seconds]" );
+      // Wait 5 seconds before retrying
+      delay( 5000 );
+    }
+  }
+}
